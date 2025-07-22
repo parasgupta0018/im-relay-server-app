@@ -1,0 +1,25 @@
+{
+  "name": "im-relay-server-app",
+  "version": "1.0.0",
+  "description": "Relay Server Application",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "im-install": "powershell -ExecutionPolicy Bypass -File ./scripts/im-install.ps1"
+
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/parasgupta0018/im-relay-server-app.git"
+  },
+  "author": "",
+  "bugs": {
+    "url": "https://github.com/parasgupta0018/im-relay-server-app/issues"
+  },
+  "homepage": "https://github.com/parasgupta0018/im-relay-server-app#readme",
+  "dependencies": {
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+}

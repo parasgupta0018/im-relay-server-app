@@ -1,0 +1,35 @@
+name: Publish to GitHub Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'NPM package name to mirror'
+        required: true
+      package_version:
+        description: 'Package version to mirror'
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '16.13.2'
+          registry-url: 'https://npm.pkg.github.com'
+
+      - name: Download and Publish Package
+        run: |
+          # Create a temporary directory
+          mkdir temp-package && cd temp-package
+          # Download the specific package version from npmjs
+          npm pack ${{ github.event.inputs.package_name }}@${{ github.event.inputs.package_version }}
+          # Publish the downloaded .tgz file to GitHub Packages
+          npm publish *.tgz
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
