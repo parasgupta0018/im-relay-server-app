@@ -59,14 +59,61 @@ jobs:
           # Download the specific package version from the public npmjs registry
           npm pack ${{ github.event.inputs.package_name }}@${{ steps.resolve_version.outputs.resolved_version }} --registry=https://registry.npmjs.org/
           
-          echo "Package downloaded and cached"
+          # Extract the downloaded package
+          tar -xzf *.tgz
+          
+          # Modify package.json to add proper scope and registry
+          cd package
+          
+          # Backup original package.json
+          cp package.json package.json.backup
+          
+          # Update package.json with scoped name and publishConfig
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            
+            // Change package name to scoped version
+            const originalName = pkg.name;
+            pkg.name = '@${{ github.repository_owner }}/' + originalName;
+            
+            // Add publishConfig for GitHub Packages
+            pkg.publishConfig = {
+              registry: 'https://npm.pkg.github.com'
+            };
+            
+            // Add repository info if not present
+            if (!pkg.repository) {
+              pkg.repository = {
+                type: 'git',
+                url: 'git+https://github.com/${{ github.repository }}.git'
+              };
+            }
+            
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+            console.log('Updated package name from', originalName, 'to', pkg.name);
+          "
+          
+          # Repackage with modified package.json
+          cd ..
+          rm -f *.tgz
+          tar -czf "${{ github.event.inputs.package_name }}-${{ steps.resolve_version.outputs.resolved_version }}.tgz" package/
+          
+          echo "Package downloaded, modified, and cached"
           ls -la
 
       - name: Use Cached Package
         if: steps.cache_package.outputs.cache-hit == 'true'
         run: |
           echo "Cache hit - using cached package"
-          ls -la cached-packages/
+          cd cached-packages
+          ls -la
+          
+          # If cached package is in directory form, ensure it's properly packaged
+          if [ -d "package" ]; then
+            echo "Found cached package directory, creating .tgz for publishing"
+            tar -czf "${{ github.event.inputs.package_name }}-${{ steps.resolve_version.outputs.resolved_version }}.tgz" package/
+          fi
 
       - name: Check if package already exists in GitHub Packages
         id: check_github_package
@@ -86,8 +133,18 @@ jobs:
         if: steps.check_github_package.outputs.exists == 'false'
         run: |
           cd cached-packages
-          # Publish the cached .tgz file to GitHub Packages
-          npm publish *.tgz
+          
+          # If we have a directory structure (from fresh download), navigate to it
+          if [ -d "package" ]; then
+            cd package
+            echo "Publishing from extracted package directory"
+            npm publish
+          else
+            # If we have a pre-built .tgz (from cache), use it directly
+            echo "Publishing from cached .tgz file"
+            npm publish *.tgz
+          fi
+          
           echo "Package published to GitHub Packages successfully"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -100,7 +157,7 @@ jobs:
       - name: Log Cache Status
         run: |
           if [ "${{ steps.cache_package.outputs.cache-hit }}" = "true" ]; then
-            echo "✅ Used cached package from previous workflow run"
+            echo "Used cached package from previous workflow run"
           else
-            echo "📦 Downloaded fresh package from NPM registry and cached for future runs"
+            echo "Downloaded fresh package from NPM registry and cached for future runs"
           fi
