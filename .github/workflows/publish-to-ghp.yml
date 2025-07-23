@@ -1,4 +1,4 @@
-name: Publish to GitHub Packages
+name: Publish to GitHub Packages with Caching
 
 on:
   workflow_dispatch:
@@ -27,35 +27,80 @@ jobs:
           registry-url: 'https://npm.pkg.github.com'
           scope: '@${{ github.repository_owner }}'
 
-      - name: Check if package already exists
-        id: check_package
+      - name: Resolve package version
+        id: resolve_version
         run: |
-          # This command will succeed (exit code 0) if the package exists, and fail otherwise.
-          # We check the exit code directly, which is more reliable than checking file size.
-          if npm view @${{ github.repository_owner }}/${{ github.event.inputs.package_name }} version > /dev/null 2>&1; then
-            echo "Package found. Skipping publish."
+          if [ "${{ github.event.inputs.package_version }}" = "latest" ]; then
+            # Get the actual latest version number
+            ACTUAL_VERSION=$(npm view ${{ github.event.inputs.package_name }} version --registry=https://registry.npmjs.org/)
+            echo "resolved_version=$ACTUAL_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "resolved_version=${{ github.event.inputs.package_version }}" >> $GITHUB_OUTPUT
+          fi
+          echo "Resolved version: $ACTUAL_VERSION"
+
+      - name: Cache NPM Package
+        id: cache_package
+        uses: actions/cache@v4
+        with:
+          path: ./cached-packages
+          key: npm-package-${{ github.event.inputs.package_name }}-${{ steps.resolve_version.outputs.resolved_version }}
+          restore-keys: |
+            npm-package-${{ github.event.inputs.package_name }}-
+
+      - name: Download Package from NPM
+        if: steps.cache_package.outputs.cache-hit != 'true'
+        run: |
+          echo "Cache miss - downloading package from NPM registry"
+          # Create directory for cached packages
+          mkdir -p cached-packages
+          cd cached-packages
+          
+          # Download the specific package version from the public npmjs registry
+          npm pack ${{ github.event.inputs.package_name }}@${{ steps.resolve_version.outputs.resolved_version }} --registry=https://registry.npmjs.org/
+          
+          echo "Package downloaded and cached"
+          ls -la
+
+      - name: Use Cached Package
+        if: steps.cache_package.outputs.cache-hit == 'true'
+        run: |
+          echo "Cache hit - using cached package"
+          ls -la cached-packages/
+
+      - name: Check if package already exists in GitHub Packages
+        id: check_github_package
+        run: |
+          # Check if the package already exists in GitHub Packages
+          if npm view @${{ github.repository_owner }}/${{ github.event.inputs.package_name }}@${{ steps.resolve_version.outputs.resolved_version }} version > /dev/null 2>&1; then
+            echo "Package already exists in GitHub Packages. Skipping publish."
             echo "exists=true" >> $GITHUB_OUTPUT
           else
-            echo "Package not found. Proceeding to publish."
+            echo "Package not found in GitHub Packages. Proceeding to publish."
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download and Publish Package
-        if: steps.check_package.outputs.exists == 'false'
+      - name: Publish Package to GitHub Packages
+        if: steps.check_github_package.outputs.exists == 'false'
         run: |
-          # Create a temporary directory
-          mkdir temp-package && cd temp-package
-          # Download the specific package version from the public npmjs registry
-          npm pack ${{ github.event.inputs.package_name }}@${{ github.event.inputs.package_version }} --registry=https://registry.npmjs.org/
-          # Publish the downloaded .tgz file to GitHub Packages
+          cd cached-packages
+          # Publish the cached .tgz file to GitHub Packages
           npm publish *.tgz
+          echo "Package published to GitHub Packages successfully"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log Package Skipped
-        if: steps.check_package.outputs.exists == 'true'
+        if: steps.check_github_package.outputs.exists == 'true'
         run: |
-          echo "Skipping publish: @${{ github.repository_owner }}/${{ github.event.inputs.package_name }} already exists in GitHub Packages."
+          echo "Skipping publish: @${{ github.repository_owner }}/${{ github.event.inputs.package_name }}@${{ steps.resolve_version.outputs.resolved_version }} already exists in GitHub Packages."
 
+      - name: Log Cache Status
+        run: |
+          if [ "${{ steps.cache_package.outputs.cache-hit }}" = "true" ]; then
+            echo "✅ Used cached package from previous workflow run"
+          else
+            echo "📦 Downloaded fresh package from NPM registry and cached for future runs"
+          fi
