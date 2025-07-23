@@ -31,9 +31,9 @@ jobs:
         id: sanitize_name
         run: |
           # This step removes the version from the package name if the user accidentally includes it.
-          # It correctly handles both regular and scoped packages (e.g., axios@1.8.0 -> axios; @angular/cli@14.0.0 -> @angular/cli)
+          # It correctly handles both regular and scoped packages 
           SANITIZED_NAME=$(echo "${{ github.event.inputs.package_name }}" | sed 's/@\([^@]*\)$//')
-          echo "Original package name input: ${{ github.event.inputs.package_name }}"
+          echo "Original package name input: ${{ github.event.inputs.package_name }}, Version: ${{ github.event.inputs.package_version }}"
           echo "Sanitized package name: $SANITIZED_NAME"
           echo "sanitized_name=$SANITIZED_NAME" >> $GITHUB_OUTPUT
 
