@@ -93,7 +93,7 @@ jobs:
             // Remove or modify problematic scripts that might fail in CI
             if (pkg.scripts) {
               // Remove scripts that are likely to fail during publish
-              const scriptsToRemove = ['test', 'test:build:version', 'prepublishOnly', 'prepack', 'postpack'];
+              const scriptsToRemove = ['test', 'test:build:version', 'prepublishOnly', 'prepack', 'postpack', 'prepare'];
               scriptsToRemove.forEach(script => {
                 if (pkg.scripts[script]) {
                   console.log('Removing script:', script);
