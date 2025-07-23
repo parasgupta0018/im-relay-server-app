@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       package_name:
-        description: 'NPM package name to mirror'
+        description: 'NPM package name to mirror (e.g., "axios" or "@scope/pkg")'
         required: true
       package_version:
         description: 'Package version to mirror (e.g., "latest" or a specific version)'
@@ -27,81 +27,73 @@ jobs:
           registry-url: 'https://npm.pkg.github.com'
           scope: '@${{ github.repository_owner }}'
 
+      - name: Sanitize Package Name
+        id: sanitize_name
+        run: |
+          # This step removes the version from the package name if the user accidentally includes it.
+          # It correctly handles both regular and scoped packages (e.g., axios@1.8.0 -> axios; @angular/cli@14.0.0 -> @angular/cli)
+          SANITIZED_NAME=$(echo "${{ github.event.inputs.package_name }}" | sed 's/@\([^@]*\)$//')
+          echo "Original package name input: ${{ github.event.inputs.package_name }}"
+          echo "Sanitized package name: $SANITIZED_NAME"
+          echo "sanitized_name=$SANITIZED_NAME" >> $GITHUB_OUTPUT
+
       - name: Resolve package version
         id: resolve_version
         run: |
           if [ "${{ github.event.inputs.package_version }}" = "latest" ]; then
-            # Get the actual latest version number
-            ACTUAL_VERSION=$(npm view ${{ github.event.inputs.package_name }} version --registry=https://registry.npmjs.org/)
+            # Get the actual latest version number using the sanitized package name
+            ACTUAL_VERSION=$(npm view ${{ steps.sanitize_name.outputs.sanitized_name }} version --registry=https://registry.npmjs.org/)
             echo "resolved_version=$ACTUAL_VERSION" >> $GITHUB_OUTPUT
           else
             echo "resolved_version=${{ github.event.inputs.package_version }}" >> $GITHUB_OUTPUT
           fi
-          echo "Resolved version: $ACTUAL_VERSION"
+          echo "Resolved version: $(echo $ACTUAL_VERSION)"
 
       - name: Cache NPM Package
         id: cache_package
         uses: actions/cache@v4
         with:
           path: ./cached-packages
-          key: npm-package-${{ github.event.inputs.package_name }}-${{ steps.resolve_version.outputs.resolved_version }}
+          key: npm-package-${{ steps.sanitize_name.outputs.sanitized_name }}-${{ steps.resolve_version.outputs.resolved_version }}
           restore-keys: |
-            npm-package-${{ github.event.inputs.package_name }}-
+            npm-package-${{ steps.sanitize_name.outputs.sanitized_name }}-
 
       - name: Download Package from NPM
         if: steps.cache_package.outputs.cache-hit != 'true'
         run: |
           echo "Cache miss - downloading package from NPM registry"
-          # Create directory for cached packages
           mkdir -p cached-packages
           cd cached-packages
           
-          # Download the specific package version from the public npmjs registry
-          npm pack ${{ github.event.inputs.package_name }}@${{ steps.resolve_version.outputs.resolved_version }} --registry=https://registry.npmjs.org/
+          # Download the package using the sanitized name and resolved version
+          npm pack ${{ steps.sanitize_name.outputs.sanitized_name }}@${{ steps.resolve_version.outputs.resolved_version }} --registry=https://registry.npmjs.org/
           
-          # Extract the downloaded package
           tar -xzf *.tgz
-          
-          # Modify package.json to add proper scope and registry
           cd package
-          
-          # Backup original package.json
           cp package.json package.json.backup
           
           # Update package.json with scoped name and publishConfig
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            
-            // Change package name to scoped version
             const originalName = pkg.name;
-            pkg.name = '@${{ github.repository_owner }}/' + originalName;
-            
-            // Add publishConfig for GitHub Packages
-            pkg.publishConfig = {
-              registry: 'https://npm.pkg.github.com'
-            };
-            
-            // Add repository info if not present
+            // The sanitized name from the previous step is the correct base name
+            pkg.name = '@${{ github.repository_owner }}/' + '${{ steps.sanitize_name.outputs.sanitized_name }}'.split('/').pop();
+            pkg.publishConfig = { registry: 'https://npm.pkg.github.com' };
             if (!pkg.repository) {
               pkg.repository = {
                 type: 'git',
                 url: 'git+https://github.com/${{ github.repository }}.git'
               };
             }
-            
-            // Remove or modify problematic scripts that might fail in CI
             if (pkg.scripts) {
-              // Remove scripts that are likely to fail during publish
-              const scriptsToRemove = ['test', 'test:build:version', 'prepublishOnly', 'prepack', 'postpack', 'prepare'];
+              const scriptsToRemove = ['test', 'prepublishOnly', 'prepack', 'postpack', 'prepare'];
               scriptsToRemove.forEach(script => {
                 if (pkg.scripts[script]) {
                   console.log('Removing script:', script);
                   delete pkg.scripts[script];
                 }
               });
-              
-              // Also remove any scripts that contain 'test' or 'build' that might cause issues
               Object.keys(pkg.scripts).forEach(scriptName => {
                 if (scriptName.includes('test') || scriptName.includes('build')) {
                   console.log('Removing potentially problematic script:', scriptName);
@@ -109,14 +101,10 @@ jobs:
                 }
               });
             }
-            
             fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
             console.log('Updated package name from', originalName, 'to', pkg.name);
           "
-          
-          # Move back to parent directory
           cd ..
-          
           echo "Package downloaded, modified, and cached"
           ls -la
 
@@ -130,8 +118,8 @@ jobs:
       - name: Check if package already exists in GitHub Packages
         id: check_github_package
         run: |
-          # Check if the package already exists in GitHub Packages
-          if npm view @${{ github.repository_owner }}/${{ github.event.inputs.package_name }}@${{ steps.resolve_version.outputs.resolved_version }} version > /dev/null 2>&1; then
+          # Use the sanitized name to check if the package exists
+          if npm view @${{ github.repository_owner }}/${{ steps.sanitize_name.outputs.sanitized_name }}@${{ steps.resolve_version.outputs.resolved_version }} version > /dev/null 2>&1; then
             echo "Package already exists in GitHub Packages. Skipping publish."
             echo "exists=true" >> $GITHUB_OUTPUT
           else
@@ -144,21 +132,9 @@ jobs:
       - name: Publish Package to GitHub Packages
         if: steps.check_github_package.outputs.exists == 'false'
         run: |
-          cd cached-packages
-          
-          # Ensure we're working with the package directory
-          if [ -d "package" ]; then
-            cd package
-            echo "Publishing from extracted package directory"
-            
-            # Publish without running scripts to avoid issues
-            npm publish --ignore-scripts
-          else
-            echo "Error: Package directory not found"
-            ls -la
-            exit 1
-          fi
-          
+          cd cached-packages/package
+          echo "Publishing from extracted package directory"
+          npm publish --ignore-scripts
           echo "Package published to GitHub Packages successfully"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -166,7 +142,8 @@ jobs:
       - name: Log Package Skipped
         if: steps.check_github_package.outputs.exists == 'true'
         run: |
-          echo "Skipping publish: @${{ github.repository_owner }}/${{ github.event.inputs.package_name }}@${{ steps.resolve_version.outputs.resolved_version }} already exists in GitHub Packages."
+          # Use the sanitized name in the log message
+          echo "Skipping publish: @${{ github.repository_owner }}/${{ steps.sanitize_name.outputs.sanitized_name }}@${{ steps.resolve_version.outputs.resolved_version }} already exists in GitHub Packages."
 
       - name: Log Cache Status
         run: |
