@@ -90,14 +90,32 @@ jobs:
               };
             }
             
+            // Remove or modify problematic scripts that might fail in CI
+            if (pkg.scripts) {
+              // Remove scripts that are likely to fail during publish
+              const scriptsToRemove = ['test', 'test:build:version', 'prepublishOnly', 'prepack', 'postpack'];
+              scriptsToRemove.forEach(script => {
+                if (pkg.scripts[script]) {
+                  console.log('Removing script:', script);
+                  delete pkg.scripts[script];
+                }
+              });
+              
+              // Also remove any scripts that contain 'test' or 'build' that might cause issues
+              Object.keys(pkg.scripts).forEach(scriptName => {
+                if (scriptName.includes('test') || scriptName.includes('build')) {
+                  console.log('Removing potentially problematic script:', scriptName);
+                  delete pkg.scripts[scriptName];
+                }
+              });
+            }
+            
             fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
             console.log('Updated package name from', originalName, 'to', pkg.name);
           "
           
-          # Repackage with modified package.json
+          # Move back to parent directory
           cd ..
-          rm -f *.tgz
-          tar -czf "${{ github.event.inputs.package_name }}-${{ steps.resolve_version.outputs.resolved_version }}.tgz" package/
           
           echo "Package downloaded, modified, and cached"
           ls -la
@@ -108,12 +126,6 @@ jobs:
           echo "Cache hit - using cached package"
           cd cached-packages
           ls -la
-          
-          # If cached package is in directory form, ensure it's properly packaged
-          if [ -d "package" ]; then
-            echo "Found cached package directory, creating .tgz for publishing"
-            tar -czf "${{ github.event.inputs.package_name }}-${{ steps.resolve_version.outputs.resolved_version }}.tgz" package/
-          fi
 
       - name: Check if package already exists in GitHub Packages
         id: check_github_package
@@ -134,15 +146,17 @@ jobs:
         run: |
           cd cached-packages
           
-          # If we have a directory structure (from fresh download), navigate to it
+          # Ensure we're working with the package directory
           if [ -d "package" ]; then
             cd package
             echo "Publishing from extracted package directory"
-            npm publish
+            
+            # Publish without running scripts to avoid issues
+            npm publish --ignore-scripts
           else
-            # If we have a pre-built .tgz (from cache), use it directly
-            echo "Publishing from cached .tgz file"
-            npm publish *.tgz
+            echo "Error: Package directory not found"
+            ls -la
+            exit 1
           fi
           
           echo "Package published to GitHub Packages successfully"
@@ -157,7 +171,7 @@ jobs:
       - name: Log Cache Status
         run: |
           if [ "${{ steps.cache_package.outputs.cache-hit }}" = "true" ]; then
-            echo "Used cached package from previous workflow run"
+            echo "✅ Used cached package from previous workflow run"
           else
-            echo "Downloaded fresh package from NPM registry and cached for future runs"
+            echo "📦 Downloaded fresh package from NPM registry and cached for future runs"
           fi
