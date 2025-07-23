@@ -7,23 +7,43 @@ on:
         description: 'NPM package name to mirror'
         required: true
       package_version:
-        description: 'Package version to mirror'
+        description: 'Package version to mirror (e.g., "latest" or a specific version)'
         required: true
+        default: 'latest'
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: write # Permission to publish to GitHub Packages
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: '16.13.2'
+          node-version: '20'
           registry-url: 'https://npm.pkg.github.com'
+          scope: '@${{ github.repository_owner }}'
+
+      - name: Check if package already exists
+        id: check_package
+        run: |
+          # This command will succeed (exit code 0) if the package exists, and fail otherwise.
+          # We check the exit code directly, which is more reliable than checking file size.
+          if npm view @${{ github.repository_owner }}/${{ github.event.inputs.package_name }} version > /dev/null 2>&1; then
+            echo "Package found. Skipping publish."
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Package not found. Proceeding to publish."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download and Publish Package
+        if: steps.check_package.outputs.exists == 'false'
         run: |
           # Create a temporary directory
           mkdir temp-package && cd temp-package
@@ -33,3 +53,9 @@ jobs:
           npm publish *.tgz
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log Package Skipped
+        if: steps.check_package.outputs.exists == 'true'
+        run: |
+          echo "Skipping publish: @${{ github.repository_owner }}/${{ github.event.inputs.package_name }} already exists in GitHub Packages."
+
