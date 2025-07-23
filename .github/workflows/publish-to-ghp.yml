@@ -68,8 +68,8 @@ jobs:
           # Download the package using the sanitized name and resolved version
           npm pack ${{ steps.sanitize_name.outputs.sanitized_name }}@${{ steps.resolve_version.outputs.resolved_version }} --registry=https://registry.npmjs.org/
           echo "npm pack ${{ steps.sanitize_name.outputs.sanitized_name }}@${{ steps.resolve_version.outputs.resolved_version }} --registry=https://registry.npmjs.org/"
-          
-          tar -xzf *.tgz
+
+          tar -xzf ${{ steps.sanitize_name.outputs.sanitized_name }}-${{ steps.resolve_version.outputs.resolved_version }}.tgz
           cd package
           cp package.json package.json.backup
           
