@@ -47,8 +47,8 @@ jobs:
         run: |
           # Create a temporary directory
           mkdir temp-package && cd temp-package
-          # Download the specific package version from npmjs
-          npm pack ${{ github.event.inputs.package_name }}@${{ github.event.inputs.package_version }}
+          # Download the specific package version from the public npmjs registry
+          npm pack ${{ github.event.inputs.package_name }}@${{ github.event.inputs.package_version }} --registry=https://registry.npmjs.org/
           # Publish the downloaded .tgz file to GitHub Packages
           npm publish *.tgz
         env:
