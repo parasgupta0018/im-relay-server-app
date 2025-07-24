@@ -29,7 +29,7 @@ $GithubRepo = "im-relay-server-app"
 
 # --- SCRIPT SETUP ---
 $GithubApiUrl = "https://api.github.com/repos/$($GithubUsername)/$($GithubRepo)/actions/workflows/publish-to-ghp.yml/dispatches"
-$GithubToken = ""
+$GithubToken = $env:GITHUB_TOKEN
 
 if ([string]::IsNullOrEmpty($GithubToken)) {
     Write-Host "Error: GITHUB_TOKEN environment variable not set." -ForegroundColor Red
