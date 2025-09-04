@@ -30,7 +30,6 @@ function Load-DotEnv {
             if ($key -and $value) {
                 $value = $value.Trim('"').Trim("'")
                 [Environment]::SetEnvironmentVariable($key.Trim(), $value, "Process")
-                Write-Output "Loaded: $($key.Trim()) = $value"
             }
         }
     } else {
@@ -70,6 +69,58 @@ $headers = @{
     "Accept" = "application/vnd.github.v3+json"
 }
 
+# Helper: Update package.json to ensure unscoped dependency is present with exact version
+function Update-PackageJsonDependency {
+    param(
+        [string]$PackageName,
+        [string]$Version
+    )
+    $pkgPath = Join-Path (Get-Location) 'package.json'
+    if (-not (Test-Path $pkgPath)) { return }
+    try {
+        $jsonRaw = Get-Content $pkgPath -Raw
+        $pkgObj = $jsonRaw | ConvertFrom-Json
+        if (-not $pkgObj.dependencies) { $pkgObj | Add-Member -NotePropertyName dependencies -NotePropertyValue (@{}) }
+        # Remove any scoped variant referencing this base name for our user scope
+        $scopePrefix = "@$GithubUsername/"
+        $toRemove = @()
+        foreach ($prop in $pkgObj.dependencies.PSObject.Properties) {
+            if ($prop.Name -eq "$scopePrefix$PackageName") { $toRemove += $prop.Name }
+        }
+        foreach ($r in $toRemove) { $pkgObj.dependencies.PSObject.Properties.Remove($r) }
+        $pkgObj.dependencies.PSObject.Properties.Remove($PackageName) | Out-Null 2>$null
+        $pkgObj.dependencies | Add-Member -NotePropertyName $PackageName -NotePropertyValue $Version
+        ConvertTo-Json $pkgObj -Depth 10 | Format-Json | Set-Content $pkgPath -Encoding UTF8
+
+        Write-Host "package.json updated: $PackageName@$Version (unscoped)" -ForegroundColor DarkGreen
+    } catch {
+        Write-Warning "Failed to update package.json: $($_.Exception.Message)"
+    }
+}
+
+# Helper: Create an unscoped alias (symlink or copy) so require('pkg') works when only @user/pkg is installed
+function Ensure-UnscopedAlias {
+    param(
+        [string]$PackageName
+    )
+    $scopedDir = Join-Path (Join-Path (Get-Location) 'node_modules') "@$GithubUsername"
+    $scopedPath = Join-Path $scopedDir $PackageName
+    $unscopedPath = Join-Path (Join-Path (Get-Location) 'node_modules') $PackageName
+    if (-not (Test-Path $scopedPath)) { return }
+    if (Test-Path $unscopedPath) { return }
+    try {
+        New-Item -ItemType SymbolicLink -Path $unscopedPath -Target $scopedPath -ErrorAction Stop | Out-Null
+        Write-Host "Created symlink alias: $unscopedPath -> $scopedPath" -ForegroundColor Gray
+    } catch {
+        try {
+            Copy-Item $scopedPath $unscopedPath -Recurse -Force
+            Write-Host "Copied directory as alias (symlink failed): $unscopedPath" -ForegroundColor Gray
+        } catch {
+            Write-Warning "Could not create alias: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Get-PackageVersion {
     param(
         [string]$PackageName,
@@ -104,6 +155,46 @@ function Get-PackageVersion {
     catch {
         Write-Host "Error during version resolution for $PackageName : $($_.Exception.Message)" -ForegroundColor Red
         return $VersionSpec
+    }
+}
+
+# Suggest alternative non-deprecated versions when a requested version is deprecated or unavailable
+function Get-AlternativeVersions {
+    param(
+        [string]$PackageName,
+        [string]$ProblemVersion,
+        [int]$Max = 5
+    )
+    try {
+        $raw = npm view "$PackageName" versions --json --registry=https://registry.npmjs.org/ 2>$null
+        if (-not $raw) { return @() }
+        $versions = $raw | ConvertFrom-Json
+        if (-not $versions) { return @() }
+
+        # Keep only versions different from the problem one; take last ( newest ) slice
+        $candidates = ($versions | Where-Object { $_ -ne $ProblemVersion }) | Select-Object -Last 30
+        # Reverse to have newest first
+        $ordered = [System.Collections.Generic.List[string]]::new()
+        ($candidates | Sort-Object -Descending) | ForEach-Object { $ordered.Add($_) }
+
+        return $ordered | Select-Object -First $Max
+    } catch {
+        return @()
+    }
+}
+
+function Write-VersionSuggestions {
+    param(
+        [string]$PackageName,
+        [string]$ProblemVersion
+    )
+    $alts = Get-AlternativeVersions -PackageName $PackageName -ProblemVersion $ProblemVersion -Max 3
+    if ($alts.Count -gt 0) {
+        Write-Host "Suggested alternative versions for $PackageName (problem with $ProblemVersion):" -ForegroundColor Yellow
+        Write-Host ("  " + ($alts -join ", ")) -ForegroundColor Yellow
+        Write-Host "Try: npm run im-install -- $PackageName@$($alts[0])" -ForegroundColor DarkYellow
+    } else {
+        Write-Host "No alternative version suggestions available for $PackageName right now." -ForegroundColor Yellow
     }
 }
 
@@ -395,13 +486,21 @@ function Process-Package {
 
     Write-Host "`n--- Processing package: $($PackageName)@$($VersionSpec) ---" -ForegroundColor Cyan
     
-    $deprecationMessage = npm view "$($PackageName)@$($VersionSpec)" deprecated --registry=https://registry.npmjs.org/
-    if (-not [string]::IsNullOrEmpty($deprecationMessage)) {
-        Write-Warning "This package version is deprecated. Message: $deprecationMessage" -ForegroundColor Yellow
-        Write-Host "Consider using a different version or package." -ForegroundColor Yellow
+    # Resolve concrete version FIRST so later checks reference the right version
+    $ConcreteVersion = Get-PackageVersion -PackageName $PackageName -VersionSpec $VersionSpec
+    if (-not $ConcreteVersion) {
+        Write-Host "Could not resolve package version, cannot proceed." -ForegroundColor Red
+        return $false
     }
 
-    $packageLicense = npm view "$($PackageName)@$($ConcreteVersion)" license --registry=https://registry.npmjs.org/
+    $deprecationMessage = npm view "${PackageName}@${ConcreteVersion}" deprecated --registry=https://registry.npmjs.org/
+    if (-not [string]::IsNullOrEmpty($deprecationMessage)) {
+        Write-Warning "This package version is deprecated. Message: $deprecationMessage"
+        Write-Host "Consider using a different version or package." -ForegroundColor Yellow
+        Write-VersionSuggestions -PackageName $PackageName -ProblemVersion $ConcreteVersion
+    }
+
+    $packageLicense = npm view "${PackageName}@${ConcreteVersion}" license --registry=https://registry.npmjs.org/
     if (-not ($allowedLicenses -contains $packageLicense)) {
         Write-Error "LICENSE VIOLATION: The license '$($packageLicense)' for $($PackageName)@$($ConcreteVersion) is not on the approved list. Halting installation."
         return $false
@@ -450,7 +549,7 @@ function Process-Package {
     }
 
     # Check Node.js compatibility before proceeding
-    $isCompatible = Check-NodeCompatibility -PackageName $PackageName -PackageVersion $VersionSpec
+    $isCompatible = Check-NodeCompatibility -PackageName $PackageName -PackageVersion $ConcreteVersion
     if (-not $isCompatible) {
         Write-Host "Proceeding despite compatibility warning..." -ForegroundColor Yellow
     }
@@ -458,13 +557,6 @@ function Process-Package {
     if ($PackageName.StartsWith("@")) {
         Write-Host "Skipping already-scoped package: $($PackageName)" -ForegroundColor Green
         return $true
-    }
-
-    # Step 1: Resolve the requested version to a concrete version number from the public registry.
-    $ConcreteVersion = Get-PackageVersion -PackageName $PackageName -VersionSpec $VersionSpec
-    if (-not $ConcreteVersion) {
-        Write-Host "Could not resolve package version, cannot proceed." -ForegroundColor Red
-        return $false
     }
 
     $ScopedPackageNameWithVersion = "@$($GithubUsername)/$($PackageName)"
@@ -523,6 +615,47 @@ function Process-Package {
     }
 }
 
+function Format-Json {
+    [CmdletBinding(DefaultParameterSetName = 'Prettify')]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]$Json,
+
+        [Parameter(ParameterSetName = 'Minify')]
+        [switch]$Minify,
+
+        [Parameter(ParameterSetName = 'Prettify')]
+        [ValidateRange(1, 1024)]
+        [int]$Indentation = 2,
+
+        [Parameter(ParameterSetName = 'Prettify')]
+        [switch]$AsArray
+    )
+    if ($PSCmdlet.ParameterSetName -eq 'Minify') {
+        return ($Json | ConvertFrom-Json) | ConvertTo-Json -Depth 100 -Compress
+    }
+    if ($Json -notmatch '\r?\n') {
+        $Json = ($Json | ConvertFrom-Json) | ConvertTo-Json -Depth 100
+    }
+    $indent = 0
+    $regexUnlessQuoted = '(?=([^"]*"[^"]*")*[^"]*$)'
+    $result = ($Json -split '\r?\n' | ForEach-Object {
+        if (($_ -match "[}\]]$regexUnlessQuoted") -and ($_ -notmatch "[\{\[]$regexUnlessQuoted")) {
+            $indent = [Math]::Max($indent - $Indentation, 0)
+        }
+        # Replace all colon-space combinations by ": " unless it is inside quotes.
+        $line = (' ' * $indent) + ($_.TrimStart() -replace ":\s+$regexUnlessQuoted", ': ')
+        if (($_ -match "[\{\[]$regexUnlessQuoted") -and ($_ -notmatch "[}\]]$regexUnlessQuoted")) {
+            $indent += $Indentation
+        }
+        $line -replace '\\u0027', "'"
+    # join the array with newlines and convert multiline empty [] or {} into inline arrays or objects
+    }) -join [Environment]::NewLine -replace '(\[)\s+(\])', '$1$2' -replace '(\{)\s+(\})', '$1$2'
+
+    if ($AsArray) { return ,[string[]]($result -split '\r?\n') }
+    $result
+}
+
 
 # --- SCRIPT LOGIC ---
 
@@ -551,25 +684,39 @@ if ($args.Count -gt 0) {
         # Now, process the package with the correctly parsed name and version
         $canInstall = Process-Package -PackageName $packageNameFromArg -VersionSpec $versionSpecFromArg
         if ($canInstall) {
-            $ScopedPackageName = "@$($GithubUsername)/$($packageNameFromArg)"
-            
-            # Ensure we install the specific, resolved version, not just the 'latest' tag.
+            # Resolve concrete version
             $installVersion = Get-PackageVersion -PackageName $packageNameFromArg -VersionSpec $versionSpecFromArg
-            $packageToInstall = "$($ScopedPackageName)@$($installVersion)"
-
-            Write-Host "Installing $($packageToInstall)..."
+            $scopedInstall = "@$GithubUsername/$packageNameFromArg@$installVersion"
+            Write-Host "Installing (scoped from GitHub cache) $scopedInstall ..." -ForegroundColor Cyan
             try {
-                npm install $packageToInstall
+                # Install scoped package (registry for this scope is set via .npmrc; don't override global to allow unscoped deps from public registry)
+                $installOutput = npm install $scopedInstall --no-save 2>&1 | Tee-Object -Variable rawOut
                 if ($LASTEXITCODE -eq 0) {
-                    Write-Host "Successfully installed $($packageToInstall)!" -ForegroundColor Green
-                    $successfulPackages += $packageToInstall
+                    Write-Host "Downloaded scoped package: $scopedInstall" -ForegroundColor Green
+                    Update-PackageJsonDependency -PackageName $packageNameFromArg -Version $installVersion
+                    Ensure-UnscopedAlias -PackageName $packageNameFromArg
+                    $successfulPackages += "$packageNameFromArg@$installVersion"
                 } else {
-                    Write-Host "Error installing $($packageToInstall)" -ForegroundColor Red
+                    if ($rawOut -match 'E404' -or $rawOut -match '404 Not Found') {
+                        Write-Warning "Scoped package not found. Falling back to public unscoped install: $packageNameFromArg@$installVersion"
+                        npm install "$packageNameFromArg@$installVersion" --save-exact
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Host "Installed unscoped from public registry: $packageNameFromArg@$installVersion" -ForegroundColor Yellow
+                            Update-PackageJsonDependency -PackageName $packageNameFromArg -Version $installVersion
+                            $successfulPackages += "$packageNameFromArg@$installVersion"
+                        } else {
+                            Write-Host "Error installing fallback unscoped package $packageNameFromArg@$installVersion" -ForegroundColor Red
+                            Write-VersionSuggestions -PackageName $packageNameFromArg -ProblemVersion $installVersion
+                        }
+                    } else {
+                        Write-Host "Error installing $scopedInstall" -ForegroundColor Red
+                        Write-VersionSuggestions -PackageName $packageNameFromArg -ProblemVersion $installVersion
+                    }
                 }
-            }
-            catch {
-                Write-Host "Error installing $($packageToInstall)" -ForegroundColor Red
+            } catch {
+                Write-Host "Error installing $scopedInstall" -ForegroundColor Red
                 Write-Host $_.Exception.Message
+                Write-VersionSuggestions -PackageName $packageNameFromArg -ProblemVersion $installVersion
             }
         } else {
             $pendingPackages += "$($packageNameFromArg)@$($versionSpecFromArg)"
@@ -621,38 +768,36 @@ else {
     foreach ($entry in $allDependencies.GetEnumerator()) {
         $isAvailable = Process-Package -PackageName $entry.Name -VersionSpec $entry.Value
         if ($isAvailable) {
-            $ScopedPackageName = "$($entry.Name)"
-
-            # Check for a version specifier, like 'axios@1.8.0'.
-            $lastAtIdx = $entry.Name.LastIndexOf('@')
-            if ($lastAtIdx -gt 0) {
-                $entry.Name = $entry.Name.Substring($lastAtIdx + 1)
-            }
-            
-            # Ensure we install the specific, resolved version, not just the 'latest' tag.
-            $versionSpecFromArg = Get-PackageVersion -PackageName $entry.Name -VersionSpec $entry.Value
-            $packageToInstall = "$($ScopedPackageName)@$($versionSpecFromArg)"
-            
-
+            $resolvedVersion = Get-PackageVersion -PackageName $entry.Name -VersionSpec $entry.Value
+            $scopedInstall = "@$GithubUsername/$($entry.Name)@$resolvedVersion"
             try {
-                if ($packageToInstall.StartsWith("@")) {
-                    Write-Host "Installing $($packageToInstall)..."
-                } else {
-                    $packageToInstall = "@$($GithubUsername)/$($packageToInstall)"
-                    Write-Host "Installing scoped package: $($packageToInstall)" -ForegroundColor Cyan
-                }
-
-                npm install $packageToInstall --registry https://npm.pkg.github.com --no-save
+                # Scoped install; .npmrc handles registry routing
+                $cacheOut = npm install $scopedInstall --no-save 2>&1 | Tee-Object -Variable rawCacheOut
                 if ($LASTEXITCODE -eq 0) {
-                    Write-Host "Successfully installed $($packageToInstall)!" -ForegroundColor Green
+                    Write-Host "Cached / verified $scopedInstall" -ForegroundColor Green
+                    Update-PackageJsonDependency -PackageName $entry.Name -Version $resolvedVersion
+                    Ensure-UnscopedAlias -PackageName $entry.Name
                     $cachedCount++
                 } else {
-                    Write-Host "Error installing $($packageToInstall)" -ForegroundColor Red
+                    if ($rawCacheOut -match 'E404' -or $rawCacheOut -match '404 Not Found') {
+                        Write-Warning "Scoped package not found for $($entry.Name). Falling back to unscoped public install."
+                        npm install "$($entry.Name)@$resolvedVersion" --save-exact --no-save
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Host "Installed unscoped $($entry.Name)@$resolvedVersion from public registry" -ForegroundColor Yellow
+                            Update-PackageJsonDependency -PackageName $entry.Name -Version $resolvedVersion
+                            $cachedCount++
+                        } else {
+                            Write-Host "Error installing fallback unscoped $($entry.Name)@$resolvedVersion" -ForegroundColor Red
+                            Write-VersionSuggestions -PackageName $entry.Name -ProblemVersion $resolvedVersion
+                        }
+                    } else {
+                        Write-Host "Error installing $scopedInstall" -ForegroundColor Red
+                        Write-VersionSuggestions -PackageName $entry.Name -ProblemVersion $resolvedVersion
+                    }
                 }
-            }
-            catch {
-                Write-Host "Error installing $($packageToInstall)" -ForegroundColor Red
-                Write-Host $_.Exception.Message
+            } catch {
+                Write-Host "Error installing $scopedInstall" -ForegroundColor Red
+                Write-VersionSuggestions -PackageName $entry.Name -ProblemVersion $resolvedVersion
             }
         } else {
             $pendingCount++
