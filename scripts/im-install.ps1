@@ -21,15 +21,43 @@
   - Provides better logging and status information
 #>
 
+function Load-DotEnv {
+    param([string]$Path = ".env")
+    
+    if (Test-Path $Path) {
+        Get-Content $Path | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object {
+            $key, $value = $_ -split '=', 2
+            if ($key -and $value) {
+                $value = $value.Trim('"').Trim("'")
+                [Environment]::SetEnvironmentVariable($key.Trim(), $value, "Process")
+                Write-Output "Loaded: $($key.Trim()) = $value"
+            }
+        }
+    } else {
+        Write-Warning "Environment file not found: $Path"
+    }
+}
+
+# Load environment variables from .env file if it exists
+Load-DotEnv -Path "./.env"
+
 # --- CONFIGURATION ---
-# IMPORTANT: Change these to your actual GitHub username and repository name.
-$GithubUsername = "parasgupta0018"
-$GithubRepo = "im-relay-server-app"
-# ---------------------
+$GithubUsername = [Environment]::GetEnvironmentVariable("GITHUB_USER_NAME")
+$GithubRepo = [Environment]::GetEnvironmentVariable("GITHUB_REPOSITORY_NAME")
 
 # --- SCRIPT SETUP ---
 $GithubApiUrl = "https://api.github.com/repos/$($GithubUsername)/$($GithubRepo)/actions/workflows/publish-to-ghp.yml/dispatches"
-$GithubToken = $env:GITHUB_TOKEN
+$GithubToken = [Environment]::GetEnvironmentVariable("GITHUB_PERSONAL_ACCESS_TOKEN")
+
+# At the top of your script or in the function, define allowed licenses
+$allowedLicenses = @(
+    'MIT',
+    'ISC',
+    'Apache-2.0',
+    'BSD-2-Clause',
+    'BSD-3-Clause'
+    # Add other licenses you approve
+)
 
 if ([string]::IsNullOrEmpty($GithubToken)) {
     Write-Host "Error: GITHUB_TOKEN environment variable not set." -ForegroundColor Red
@@ -165,6 +193,200 @@ function Wait-For-Workflow {
     }
 }
 
+function Parse-VersionFromPackageJson {
+    param(
+        [string]$VersionSpec
+    )
+    
+    # Remove common version prefixes like ^, ~, >=, etc.
+    $cleanVersion = $VersionSpec -replace '^[\^~>=<]+', ''
+    
+    # If it's a complex version range, default to latest
+    if ($cleanVersion -match '[*x]' -or $cleanVersion -match '\|\|' -or $cleanVersion -match ' - ') {
+        return "latest"
+    }
+    
+    return $cleanVersion
+}
+
+function Check-NodeCompatibility {
+    param (
+        [string]$PackageName,
+        [string]$PackageVersion = "latest"
+    )
+
+    # Check if Node.js is available
+    try {
+        $null = Get-Command node -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Node.js not found. Skipping compatibility check for $PackageName"
+        return $true
+    }
+
+    # Get current Node version
+    try {
+        $currentNodeVersionRaw = node -v 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($currentNodeVersionRaw)) {
+            Write-Warning "Could not determine Node.js version. Skipping compatibility check."
+            return $true
+        }
+        
+        $currentNodeVersion = $currentNodeVersionRaw -replace '^v', ''
+        $currentVer = [System.Version]::Parse($currentNodeVersion)
+        Write-Host "Current Node.js version: $currentNodeVersion" -ForegroundColor Gray
+    }
+    catch {
+        Write-Warning "Could not parse Node.js version: $currentNodeVersionRaw"
+        return $true
+    }
+
+    try {
+        # Get the engines.node field - handle both string and object responses
+        $enginesNodeRaw = npm view "$PackageName@$PackageVersion" engines.node --json --registry=https://registry.npmjs.org/ 2>$null
+        
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($enginesNodeRaw) -or $enginesNodeRaw -eq "undefined") {
+            Write-Host "No Node.js engine constraints found for $PackageName@$PackageVersion" -ForegroundColor Gray
+            return $true
+        }
+
+        # Clean up the JSON response
+        $enginesNode = $enginesNodeRaw.Trim('"') -replace '\\', ''
+        
+        if ([string]::IsNullOrEmpty($enginesNode) -or $enginesNode -eq "null") {
+            Write-Host "No Node.js engine constraints specified for $PackageName@$PackageVersion" -ForegroundColor Gray
+            return $true
+        }
+
+        Write-Host "Checking Node.js compatibility for $PackageName@$PackageVersion (requires: $enginesNode)" -ForegroundColor Yellow
+        
+        # Handle different constraint formats
+        $compatible = Test-NodeVersionConstraint -CurrentVersion $currentVer -Constraint $enginesNode
+        
+        if (-not $compatible) {
+            Write-Warning "COMPATIBILITY WARNING: $PackageName@$PackageVersion requires Node.js $enginesNode, but you have $currentNodeVersion"
+            Write-Host "Consider upgrading Node.js or using a different package version." -ForegroundColor Yellow
+            return $false
+        }
+        else {
+            Write-Host "Node.js version compatibility: OK" -ForegroundColor Green
+            return $true
+        }
+    }
+    catch {
+        Write-Warning "Could not check Node.js compatibility for $PackageName@$PackageVersion : $($_.Exception.Message)"
+        return $true  # Don't block installation on compatibility check failures
+    }
+}
+
+function Test-NodeVersionConstraint {
+    param(
+        [System.Version]$CurrentVersion,
+        [string]$Constraint
+    )
+    
+    # Handle range constraints like ">=14.0.0 <17.0.0" or ">=16"
+    if ($Constraint -match '\s+') {
+        $constraints = $Constraint -split '\s+'
+        foreach ($c in $constraints) {
+            $c = $c.Trim()
+            if (-not [string]::IsNullOrEmpty($c) -and -not (Test-SingleVersionConstraint -CurrentVersion $CurrentVersion -Constraint $c)) {
+                return $false
+            }
+        }
+        return $true
+    }
+    else {
+        return Test-SingleVersionConstraint -CurrentVersion $CurrentVersion -Constraint $Constraint
+    }
+}
+
+function Test-SingleVersionConstraint {
+    param(
+        [System.Version]$CurrentVersion,
+        [string]$Constraint
+    )
+    
+    # Parse version constraint patterns
+    if ($Constraint -match '^(>=|<=|>|<|=|~|\^)?\s*([0-9]+(?:\.[0-9]+)?(?:\.[0-9]+)?)(.*)$') {
+        $operator = if ($matches[1]) { $matches[1] } else { "=" }
+        $versionStr = $matches[2]
+        
+        # Handle incomplete version numbers (e.g., "14" -> "14.0.0")
+        $versionParts = $versionStr -split '\.'
+        while ($versionParts.Length -lt 3) {
+            $versionParts += "0"
+        }
+        $normalizedVersion = $versionParts[0..2] -join '.'
+        
+        try {
+            $targetVer = [System.Version]::Parse($normalizedVersion)
+        }
+        catch {
+            Write-Warning "Could not parse version constraint: $Constraint"
+            return $true
+        }
+
+        switch ($operator) {
+            ">=" { 
+                return $CurrentVersion -ge $targetVer
+            }
+            "<=" { 
+                return $CurrentVersion -le $targetVer
+            }
+            ">" { 
+                return $CurrentVersion -gt $targetVer
+            }
+            "<" { 
+                return $CurrentVersion -lt $targetVer
+            }
+            "=" { 
+                return $CurrentVersion -eq $targetVer
+            }
+            "~" {
+                # Tilde allows patch-level changes if a minor version is specified
+                # ~1.2.3 := >=1.2.3 <1.3.0 (reasonably close to 1.2.3)
+                # ~1.2 := >=1.2.0 <1.3.0 (Same as ~1.2.0)
+                # ~1 := >=1.0.0 <2.0.0 (Same as ~1.0.0)
+                if ($versionParts.Length -ge 2) {
+                    $nextMinor = [System.Version]::new($targetVer.Major, $targetVer.Minor + 1, 0)
+                    return ($CurrentVersion -ge $targetVer) -and ($CurrentVersion -lt $nextMinor)
+                }
+                else {
+                    $nextMajor = [System.Version]::new($targetVer.Major + 1, 0, 0)
+                    return ($CurrentVersion -ge $targetVer) -and ($CurrentVersion -lt $nextMajor)
+                }
+            }
+            "^" {
+                # Caret allows changes that do not modify the left-most non-zero digit
+                # ^1.2.3 := >=1.2.3 <2.0.0
+                # ^0.2.3 := >=0.2.3 <0.3.0
+                # ^0.0.3 := >=0.0.3 <0.0.4
+                if ($targetVer.Major -gt 0) {
+                    $nextMajor = [System.Version]::new($targetVer.Major + 1, 0, 0)
+                    return ($CurrentVersion -ge $targetVer) -and ($CurrentVersion -lt $nextMajor)
+                }
+                elseif ($targetVer.Minor -gt 0) {
+                    $nextMinor = [System.Version]::new($targetVer.Major, $targetVer.Minor + 1, 0)
+                    return ($CurrentVersion -ge $targetVer) -and ($CurrentVersion -lt $nextMinor)
+                }
+                else {
+                    $nextPatch = [System.Version]::new($targetVer.Major, $targetVer.Minor, $targetVer.Build + 1)
+                    return ($CurrentVersion -ge $targetVer) -and ($CurrentVersion -lt $nextPatch)
+                }
+            }
+            default {
+                Write-Warning "Unrecognized version operator: $operator"
+                return $true
+            }
+        }
+    }
+    else {
+        Write-Warning "Could not parse version constraint: $Constraint"
+        return $true
+    }
+}
+
 function Process-Package {
     param(
         [string]$PackageName,
@@ -173,6 +395,66 @@ function Process-Package {
 
     Write-Host "`n--- Processing package: $($PackageName)@$($VersionSpec) ---" -ForegroundColor Cyan
     
+    $deprecationMessage = npm view "$($PackageName)@$($VersionSpec)" deprecated --registry=https://registry.npmjs.org/
+    if (-not [string]::IsNullOrEmpty($deprecationMessage)) {
+        Write-Warning "This package version is deprecated. Message: $deprecationMessage" -ForegroundColor Yellow
+        Write-Host "Consider using a different version or package." -ForegroundColor Yellow
+    }
+
+    $packageLicense = npm view "$($PackageName)@$($ConcreteVersion)" license --registry=https://registry.npmjs.org/
+    if (-not ($allowedLicenses -contains $packageLicense)) {
+        Write-Error "LICENSE VIOLATION: The license '$($packageLicense)' for $($PackageName)@$($ConcreteVersion) is not on the approved list. Halting installation."
+        return $false
+    }
+
+    function Check-DependencyLicenses {
+        param(
+            [string]$RootPackage,
+            [string]$RootVersion
+        )
+        $checked = @{}
+        function CheckRecursively {
+            param(
+                [string]$Pkg,
+                [string]$Ver
+            )
+            $key = "$Pkg@$Ver"
+            if ($checked.ContainsKey($key)) { return $true }
+            $checked[$key] = $true
+            $depLicense = npm view "$Pkg@$Ver" license --registry=https://registry.npmjs.org/
+            if (-not ($allowedLicenses -contains $depLicense)) {
+                Write-Error "LICENSE VIOLATION: The license '$($depLicense)' for dependency $Pkg@$Ver is not on the approved list. Halting installation."
+                return $false
+            }
+            $deps = npm view "$Pkg@$Ver" dependencies --json --registry=https://registry.npmjs.org/
+            if (-not [string]::IsNullOrEmpty($deps)) {
+                try {
+                    $depObj = $deps | ConvertFrom-Json
+                    foreach ($depName in $depObj.Keys) {
+                        $depVerSpec = $depObj[$depName]
+                        $depVer = Get-PackageVersion -PackageName $depName -VersionSpec $depVerSpec
+                        if (-not (CheckRecursively -Pkg $depName -Ver $depVer)) {
+                            return $false
+                        }
+                    }
+                } catch {}
+            }
+            return $true
+        }
+        return CheckRecursively -Pkg $RootPackage -Ver $RootVersion
+    }
+
+    if (-not (Check-DependencyLicenses -RootPackage $PackageName -RootVersion $ConcreteVersion)) {
+        Write-Error "LICENSE VIOLATION: One or more dependencies of $PackageName@$ConcreteVersion have unapproved licenses. Halting installation."
+        return $false
+    }
+
+    # Check Node.js compatibility before proceeding
+    $isCompatible = Check-NodeCompatibility -PackageName $PackageName -PackageVersion $VersionSpec
+    if (-not $isCompatible) {
+        Write-Host "Proceeding despite compatibility warning..." -ForegroundColor Yellow
+    }
+
     if ($PackageName.StartsWith("@")) {
         Write-Host "Skipping already-scoped package: $($PackageName)" -ForegroundColor Green
         return $true
@@ -198,6 +480,12 @@ function Process-Package {
     if ($versionExists) {
         # The package and exact version exist in the cache. We can install it.
         Write-Host "Package found in GitHub Packages cache." -ForegroundColor Green
+
+        # Check if the package still exists publicly
+        npm view "$($PackageName)@$($ConcreteVersion)" version --registry=https://registry.npmjs.org/ > $null 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "The original package '$($PackageName)@$($ConcreteVersion)' no longer exists on the public NPM registry. You are installing from your private cache." -ForegroundColor Red
+        }
         return $true
     }
 
@@ -235,21 +523,6 @@ function Process-Package {
     }
 }
 
-function Parse-VersionFromPackageJson {
-    param(
-        [string]$VersionSpec
-    )
-    
-    # Remove common version prefixes like ^, ~, >=, etc.
-    $cleanVersion = $VersionSpec -replace '^[\^~>=<]+', ''
-    
-    # If it's a complex version range, default to latest
-    if ($cleanVersion -match '[*x]' -or $cleanVersion -match '\|\|' -or $cleanVersion -match ' - ') {
-        return "latest"
-    }
-    
-    return $cleanVersion
-}
 
 # --- SCRIPT LOGIC ---
 
@@ -359,10 +632,17 @@ else {
             # Ensure we install the specific, resolved version, not just the 'latest' tag.
             $versionSpecFromArg = Get-PackageVersion -PackageName $entry.Name -VersionSpec $entry.Value
             $packageToInstall = "$($ScopedPackageName)@$($versionSpecFromArg)"
-            Write-Host "Installing $($packageToInstall)..."
+            
 
             try {
-                npm install $packageToInstall
+                if ($packageToInstall.StartsWith("@")) {
+                    Write-Host "Installing $($packageToInstall)..."
+                } else {
+                    $packageToInstall = "@$($GithubUsername)/$($packageToInstall)"
+                    Write-Host "Installing scoped package: $($packageToInstall)" -ForegroundColor Cyan
+                }
+
+                npm install $packageToInstall --registry https://npm.pkg.github.com --no-save
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "Successfully installed $($packageToInstall)!" -ForegroundColor Green
                     $cachedCount++
@@ -391,3 +671,4 @@ else {
         Write-Host "`nAll dependencies are cached and ready to use!" -ForegroundColor Green
     }
 }
+
