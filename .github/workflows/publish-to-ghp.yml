@@ -90,32 +90,45 @@ jobs:
           echo "Packing all dependencies..."
           WORKSPACE_ROOT=$(pwd)
           cd node_modules
-          find . -name "package.json" -type f | while read -r pkg_json; do
+          
+          # Use a different approach to avoid subshell issues with while loop
+          find . -name "package.json" -type f > ../dependency-cache/package-list.txt
+          
+          while IFS= read -r pkg_json; do
             pkg_dir=$(dirname "$pkg_json")
             original_dir=$(pwd)
             cd "$pkg_dir"
             
             # Get package info
-            pkg_name=$(node -p "require('./package.json').name")
-            pkg_version=$(node -p "require('./package.json').version")
+            pkg_name=$(node -p "require('./package.json').name" 2>/dev/null) || continue
+            pkg_version=$(node -p "require('./package.json').version" 2>/dev/null) || continue
             
-            echo "Processing: $pkg_name@$pkg_version"
+            # Skip the main package - we handle it separately
+            if [ "$pkg_name" = "${{ steps.sanitize_name.outputs.sanitized_name }}" ]; then
+              echo "Skipping main package: $pkg_name@$pkg_version (handled separately)"
+              cd "$original_dir"
+              continue
+            fi
+            
+            echo "Processing dependency: $pkg_name@$pkg_version"
             
             # Create safe filename for caching
             safe_name=$(echo "$pkg_name" | sed 's/[@\/]/_/g')
             
             # Pack the package
-            npm pack --quiet
-            
-            # Move the packed file to our cache using absolute path
-            tgz_file=$(ls *.tgz 2>/dev/null | head -1)
-            if [ -n "$tgz_file" ]; then
-              mv "$tgz_file" "${WORKSPACE_ROOT}/../dependency-cache/${safe_name}-${pkg_version}.tgz"
-              echo "Cached: ${safe_name}-${pkg_version}.tgz"
+            if npm pack --quiet 2>/dev/null; then
+              # Move the packed file to our cache using absolute path
+              tgz_file=$(ls *.tgz 2>/dev/null | head -1)
+              if [ -n "$tgz_file" ]; then
+                mv "$tgz_file" "${WORKSPACE_ROOT}/../dependency-cache/${safe_name}-${pkg_version}.tgz"
+                echo "Cached: ${safe_name}-${pkg_version}.tgz"
+              fi
+            else
+              echo "Failed to pack: $pkg_name@$pkg_version"
             fi
             
             cd "$original_dir"
-          done
+          done < ../dependency-cache/package-list.txt
           
           # Also handle the main package separately for publishing
           cd "${WORKSPACE_ROOT}/../cached-packages"
@@ -196,7 +209,25 @@ jobs:
       - name: Publish All Dependencies to GitHub Packages
         run: |
           echo "Publishing all dependencies to GitHub Packages..."
+          
+          # Check if dependency-cache exists and has files
+          if [ ! -d "dependency-cache" ]; then
+            echo "No dependency-cache directory found, skipping dependency publishing"
+            exit 0
+          fi
+          
+          dep_count=$(ls -1 dependency-cache/*.tgz 2>/dev/null | wc -l)
+          if [ "$dep_count" -eq 0 ]; then
+            echo "No dependency packages found in cache, skipping dependency publishing"
+            exit 0
+          fi
+          
+          echo "Found $dep_count dependency packages to process"
           cd dependency-cache
+          
+          # List all .tgz files for debugging
+          echo "Available .tgz files:"
+          ls -la *.tgz 2>/dev/null || echo "No .tgz files found"
           
           # Create a script to process each dependency
           cat > publish_deps.js << 'EOF'
@@ -208,6 +239,11 @@ jobs:
           const tgzFiles = fs.readdirSync('.').filter(f => f.endsWith('.tgz'));
           console.log(`Found ${tgzFiles.length} dependency packages to process`);
           
+          if (tgzFiles.length === 0) {
+            console.log('No .tgz files found in dependency-cache directory');
+            process.exit(0);
+          }
+          
           let published = 0;
           let skipped = 0;
           let errors = 0;
@@ -215,6 +251,13 @@ jobs:
           for (const tgzFile of tgzFiles) {
             try {
               console.log(`\nProcessing: ${tgzFile}`);
+              
+              // Check if file exists
+              if (!fs.existsSync(tgzFile)) {
+                console.log(`File ${tgzFile} does not exist, skipping...`);
+                errors++;
+                continue;
+              }
               
               // Extract the package
               const extractDir = tgzFile.replace('.tgz', '-extract');
@@ -227,11 +270,19 @@ jobs:
               
               if (!fs.existsSync(packageJsonPath)) {
                 console.log(`No package.json found in ${packageDir}, skipping...`);
+                skipped++;
                 continue;
               }
               
               const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
               const originalName = pkg.name;
+              
+              // Skip if this is the main package (already handled separately)
+              if (pkg.name === '${{ steps.sanitize_name.outputs.sanitized_name }}') {
+                console.log(`Skipping main package ${pkg.name} (handled separately)`);
+                skipped++;
+                continue;
+              }
               
               // Skip if already scoped to our organization
               if (pkg.name.startsWith('@${{ github.repository_owner }}/')) {
@@ -243,14 +294,19 @@ jobs:
               // Create scoped name
               const scopedName = '@${{ github.repository_owner }}/' + pkg.name.split('/').pop();
               
-              // Check if package already exists
+              // Check if package already exists in GitHub Packages
               try {
-                execSync(`npm view ${scopedName}@${pkg.version} version`, { stdio: 'pipe' });
+                const checkCmd = `npm view ${scopedName}@${pkg.version} version --registry=https://npm.pkg.github.com`;
+                execSync(checkCmd, { 
+                  stdio: 'pipe', 
+                  env: { ...process.env, NODE_AUTH_TOKEN: process.env.NODE_AUTH_TOKEN } 
+                });
                 console.log(`Package ${scopedName}@${pkg.version} already exists, skipping...`);
                 skipped++;
                 continue;
               } catch (e) {
                 // Package doesn't exist, continue with publishing
+                console.log(`Package ${scopedName}@${pkg.version} not found, will publish...`);
               }
               
               // Update package.json
@@ -283,12 +339,21 @@ jobs:
               fs.writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2));
               
               // Publish the package
+              const originalCwd = process.cwd();
               process.chdir(packageDir);
-              execSync('npm publish --ignore-scripts', { stdio: 'inherit' });
-              console.log(`Successfully published: ${scopedName}@${pkg.version}`);
-              published++;
+              try {
+                execSync('npm publish --ignore-scripts --registry=https://npm.pkg.github.com', { 
+                  stdio: 'inherit',
+                  env: { ...process.env, NODE_AUTH_TOKEN: process.env.NODE_AUTH_TOKEN }
+                });
+                console.log(`Successfully published: ${scopedName}@${pkg.version}`);
+                published++;
+              } catch (publishError) {
+                console.error(`Failed to publish ${scopedName}@${pkg.version}:`, publishError.message);
+                errors++;
+              }
               
-              process.chdir('../..');
+              process.chdir(originalCwd);
               
             } catch (error) {
               console.error(`Error processing ${tgzFile}:`, error.message);
@@ -300,6 +365,11 @@ jobs:
           console.log(`- Published: ${published} packages`);
           console.log(`- Skipped: ${skipped} packages`);
           console.log(`- Errors: ${errors} packages`);
+          
+          if (published === 0 && errors > 0) {
+            console.log('WARNING: No packages were published and there were errors.');
+            console.log('This might indicate an issue with the dependency caching process.');
+          }
           EOF
           
           # Run the publishing script
