@@ -88,9 +88,11 @@ jobs:
           
           # Extract all packages from node_modules and pack them
           echo "Packing all dependencies..."
+          WORKSPACE_ROOT=$(pwd)
           cd node_modules
           find . -name "package.json" -type f | while read -r pkg_json; do
             pkg_dir=$(dirname "$pkg_json")
+            original_dir=$(pwd)
             cd "$pkg_dir"
             
             # Get package info
@@ -105,18 +107,18 @@ jobs:
             # Pack the package
             npm pack --quiet
             
-            # Move the packed file to our cache
+            # Move the packed file to our cache using absolute path
             tgz_file=$(ls *.tgz 2>/dev/null | head -1)
             if [ -n "$tgz_file" ]; then
-              mv "$tgz_file" "../../../dependency-cache/${safe_name}-${pkg_version}.tgz"
+              mv "$tgz_file" "${WORKSPACE_ROOT}/../dependency-cache/${safe_name}-${pkg_version}.tgz"
               echo "Cached: ${safe_name}-${pkg_version}.tgz"
             fi
             
-            cd - > /dev/null
+            cd "$original_dir"
           done
           
           # Also handle the main package separately for publishing
-          cd ../cached-packages
+          cd "${WORKSPACE_ROOT}/../cached-packages"
           npm pack ${{ steps.sanitize_name.outputs.sanitized_name }}@${{ steps.resolve_version.outputs.resolved_version }} --registry=https://registry.npmjs.org/
           
           # Extract and modify the main package
