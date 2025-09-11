@@ -1,25 +1,4 @@
-<#
-.SYNOPSIS
-  A universal script to install or cache npm packages using the GitHub REST API with caching support.
 
-.DESCRIPTION
-  This script has two modes and does NOT require the GitHub CLI.
-  1. INSTALL MODE: If package names are provided as arguments, it installs them from a personal
-     GitHub Packages cache. If a package is not in the cache, it triggers a GitHub Action to add it.
-  2. CACHE-ALL MODE: If NO arguments are provided, it reads the project's package.json and ensures
-     all dependencies are cached by triggering the workflow for any missing ones.
-
-.NOTES
-  Prerequisites:
-  1. A GitHub Personal Access Token (PAT) with 'repo' and 'workflow' scopes.
-  2. The PAT must be stored in an environment variable named 'GITHUB_TOKEN'.
-  3. A workflow file named `publish-to-ghp.yml` must exist in your repository.
-  
-  The updated workflow now includes caching functionality that:
-  - Caches downloaded packages for faster subsequent runs
-  - Resolves "latest" versions to specific version numbers
-  - Provides better logging and status information
-#>
 
 function Load-DotEnv {
     param([string]$Path = ".env")
@@ -54,7 +33,9 @@ $allowedLicenses = @(
     'ISC',
     'Apache-2.0',
     'BSD-2-Clause',
-    'BSD-3-Clause'
+    'BSD-3-Clause',
+    'CC-BY-3.0',
+    'CC0-1.0'
     # Add other licenses you approve
 )
 
@@ -114,7 +95,7 @@ function Ensure-UnscopedAlias {
     } catch {
         try {
             Copy-Item $scopedPath $unscopedPath -Recurse -Force
-            Write-Host "Copied directory as alias (symlink failed): $unscopedPath" -ForegroundColor Gray
+            Write-Host "Copied directory as alias: $unscopedPath" -ForegroundColor Gray
         } catch {
             Write-Warning "Could not create alias: $($_.Exception.Message)"
         }
@@ -399,17 +380,20 @@ function Test-SingleVersionConstraint {
     )
     
     # Parse version constraint patterns
-    if ($Constraint -match '^(>=|<=|>|<|=|~|\^)?\s*([0-9]+(?:\.[0-9]+)?(?:\.[0-9]+)?)(.*)$') {
+    if ($Constraint -match '^(>=|<=|>|<|=|~|\^)?\s*([0-9]+(?:\.[0-9]+)?(?:\.[0-9]+)?)?(.*)$') {
         $operator = if ($matches[1]) { $matches[1] } else { "=" }
         $versionStr = $matches[2]
-        
+        # If versionStr is empty, skip parsing and return true
+        if (-not $versionStr) {
+            # No version specified after operator, treat as unconstrained
+            return $true
+        }
         # Handle incomplete version numbers (e.g., "14" -> "14.0.0")
         $versionParts = $versionStr -split '\.'
         while ($versionParts.Length -lt 3) {
             $versionParts += "0"
         }
         $normalizedVersion = $versionParts[0..2] -join '.'
-        
         try {
             $targetVer = [System.Version]::Parse($normalizedVersion)
         }
@@ -417,7 +401,6 @@ function Test-SingleVersionConstraint {
             Write-Warning "Could not parse version constraint: $Constraint"
             return $true
         }
-
         switch ($operator) {
             ">=" { 
                 return $CurrentVersion -ge $targetVer
@@ -435,10 +418,6 @@ function Test-SingleVersionConstraint {
                 return $CurrentVersion -eq $targetVer
             }
             "~" {
-                # Tilde allows patch-level changes if a minor version is specified
-                # ~1.2.3 := >=1.2.3 <1.3.0 (reasonably close to 1.2.3)
-                # ~1.2 := >=1.2.0 <1.3.0 (Same as ~1.2.0)
-                # ~1 := >=1.0.0 <2.0.0 (Same as ~1.0.0)
                 if ($versionParts.Length -ge 2) {
                     $nextMinor = [System.Version]::new($targetVer.Major, $targetVer.Minor + 1, 0)
                     return ($CurrentVersion -ge $targetVer) -and ($CurrentVersion -lt $nextMinor)
@@ -449,10 +428,6 @@ function Test-SingleVersionConstraint {
                 }
             }
             "^" {
-                # Caret allows changes that do not modify the left-most non-zero digit
-                # ^1.2.3 := >=1.2.3 <2.0.0
-                # ^0.2.3 := >=0.2.3 <0.3.0
-                # ^0.0.3 := >=0.0.3 <0.0.4
                 if ($targetVer.Major -gt 0) {
                     $nextMajor = [System.Version]::new($targetVer.Major + 1, 0, 0)
                     return ($CurrentVersion -ge $targetVer) -and ($CurrentVersion -lt $nextMajor)
@@ -481,10 +456,21 @@ function Test-SingleVersionConstraint {
 function Process-Package {
     param(
         [string]$PackageName,
-        [string]$VersionSpec = "latest"
+    [string]$VersionSpec = "latest",
+    [switch]$Recurse,
+    [switch]$NoLicenseRecursion
     )
 
+    if (-not $Global:ProcessedPackages) { $Global:ProcessedPackages = @{} }
+
     Write-Host "`n--- Processing package: $($PackageName)@$($VersionSpec) ---" -ForegroundColor Cyan
+
+    # Short-circuit if we've already processed this exact spec (pre-version resolution) to avoid redundant network calls
+    $preKey = "PRE::$PackageName@$VersionSpec"
+    if ($Global:ProcessedPackages.ContainsKey($preKey)) {
+        Write-Host "Already handled (spec): $PackageName@$VersionSpec" -ForegroundColor DarkGray
+        return $true
+    }
     
     # Resolve concrete version FIRST so later checks reference the right version
     $ConcreteVersion = Get-PackageVersion -PackageName $PackageName -VersionSpec $VersionSpec
@@ -493,6 +479,16 @@ function Process-Package {
         return $false
     }
 
+    # Short-circuit if we've already processed this resolved version
+    $resolvedKey = "RES::$PackageName@$ConcreteVersion"
+    if ($Global:ProcessedPackages.ContainsKey($resolvedKey)) {
+        Write-Host "Already handled (resolved): $PackageName@$ConcreteVersion" -ForegroundColor DarkGray
+        return $true
+    }
+
+    $Global:ProcessedPackages[$preKey] = $true
+    $Global:ProcessedPackages[$resolvedKey] = $true
+
     $deprecationMessage = npm view "${PackageName}@${ConcreteVersion}" deprecated --registry=https://registry.npmjs.org/
     if (-not [string]::IsNullOrEmpty($deprecationMessage)) {
         Write-Warning "This package version is deprecated. Message: $deprecationMessage"
@@ -500,7 +496,19 @@ function Process-Package {
         Write-VersionSuggestions -PackageName $PackageName -ProblemVersion $ConcreteVersion
     }
 
+    # Step 1: Check if the package is already in the GitHub Packages cache
+    $ScopedPackageNameWithVersion = "@$GithubUsername/$PackageName@$ConcreteVersion"
+    $versionExists = (npm view $ScopedPackageNameWithVersion versions --silent) | Select-String -Pattern $ConcreteVersion -Quiet
+
+    if ($versionExists) {
+        Write-Host "Package found in GitHub Packages cache." -ForegroundColor Green
+        # Optionally: install or return true here, skipping license check
+        return $true
+    }
+
+    # Only perform license check if not already cached
     $packageLicense = npm view "${PackageName}@${ConcreteVersion}" license --registry=https://registry.npmjs.org/
+    Write-Host "[LICENSE] Top-level license for $PackageName@$ConcreteVersion : $packageLicense" -ForegroundColor Cyan
     if (-not ($allowedLicenses -contains $packageLicense)) {
         Write-Error "LICENSE VIOLATION: The license '$($packageLicense)' for $($PackageName)@$($ConcreteVersion) is not on the approved list. Halting installation."
         return $false
@@ -520,29 +528,67 @@ function Process-Package {
             $key = "$Pkg@$Ver"
             if ($checked.ContainsKey($key)) { return $true }
             $checked[$key] = $true
+            Write-Host "Checking license for $Pkg @ $Ver ..." -ForegroundColor Cyan
             $depLicense = npm view "$Pkg@$Ver" license --registry=https://registry.npmjs.org/
+            Write-Host "  License for $Pkg @ $Ver : $depLicense" -ForegroundColor Cyan
             if (-not ($allowedLicenses -contains $depLicense)) {
                 Write-Error "LICENSE VIOLATION: The license '$($depLicense)' for dependency $Pkg@$Ver is not on the approved list. Halting installation."
                 return $false
             }
             $deps = npm view "$Pkg@$Ver" dependencies --json --registry=https://registry.npmjs.org/
-            if (-not [string]::IsNullOrEmpty($deps)) {
+            if (-not [string]::IsNullOrEmpty($deps) -and $deps -ne 'undefined') {
                 try {
                     $depObj = $deps | ConvertFrom-Json
-                    foreach ($depName in $depObj.Keys) {
-                        $depVerSpec = $depObj[$depName]
-                        $depVer = Get-PackageVersion -PackageName $depName -VersionSpec $depVerSpec
-                        if (-not (CheckRecursively -Pkg $depName -Ver $depVer)) {
-                            return $false
+                    # Handle both hashtable/object and array cases robustly
+                    if ($depObj -eq $null) {
+                        Write-Host "  No subdependencies for $Pkg@$Ver (null)" -ForegroundColor Gray
+                    } elseif ($depObj.PSObject.Properties.Count -gt 0) {
+                        $depKeys = $depObj.PSObject.Properties.Name
+                        Write-Host "  Found $($depKeys.Count) subdependencies for $Pkg@$Ver : $($depKeys -join ', ')" -ForegroundColor Yellow
+                        foreach ($depName in $depKeys) {
+                            $depVerSpec = $depObj.$depName
+                            Write-Host "    Recursing into $depName@$depVerSpec (dependency of $Pkg@$Ver)" -ForegroundColor DarkYellow
+                            $depVer = Get-PackageVersion -PackageName $depName -VersionSpec $depVerSpec
+                            if (-not (CheckRecursively -Pkg $depName -Ver $depVer)) {
+                                return $false
+                            }
                         }
+                    } elseif ($depObj -is [System.Collections.IEnumerable]) {
+                        $depArr = @($depObj)
+                        if ($depArr.Count -eq 0) {
+                            Write-Host "  No subdependencies for $Pkg@$Ver (empty array)" -ForegroundColor Gray
+                        } else {
+                            Write-Host "  Found $($depArr.Count) subdependencies for $Pkg@$Ver (array)" -ForegroundColor Yellow
+                            foreach ($dep in $depArr) {
+                                if ($dep.PSObject.Properties["name"] -and $dep.PSObject.Properties["version"]) {
+                                    $depName = $dep.name
+                                    $depVerSpec = $dep.version
+                                    Write-Host "    Recursing into $depName@$depVerSpec (dependency of $Pkg@$Ver)" -ForegroundColor DarkYellow
+                                    $depVer = Get-PackageVersion -PackageName $depName -VersionSpec $depVerSpec
+                                    if (-not (CheckRecursively -Pkg $depName -Ver $depVer)) {
+                                        return $false
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Write-Host "  Unrecognized dependency object type for $Pkg@$Ver" -ForegroundColor Red
                     }
-                } catch {}
+                } catch {
+                    Write-Host "  Failed to parse dependencies for $Pkg@$Ver : $($_.Exception.Message)" -ForegroundColor Red
+                }
+            } else {
+                Write-Host "  No subdependencies for $Pkg@$Ver (empty or undefined)" -ForegroundColor Gray
             }
             return $true
         }
-        return CheckRecursively -Pkg $RootPackage -Ver $RootVersion
+        Write-Host "Starting license check for $RootPackage@$RootVersion ..." -ForegroundColor Yellow
+        $result = CheckRecursively -Pkg $RootPackage -Ver $RootVersion
+        Write-Host "Finished license check for $RootPackage@$RootVersion" -ForegroundColor Yellow
+        return $result
     }
 
+    Write-Host "[LICENSE] Checking all dependencies for $PackageName@$ConcreteVersion ..." -ForegroundColor Magenta
     if (-not (Check-DependencyLicenses -RootPackage $PackageName -RootVersion $ConcreteVersion)) {
         Write-Error "LICENSE VIOLATION: One or more dependencies of $PackageName@$ConcreteVersion have unapproved licenses. Halting installation."
         return $false
@@ -555,7 +601,7 @@ function Process-Package {
     }
 
     if ($PackageName.StartsWith("@")) {
-        Write-Host "Skipping already-scoped package: $($PackageName)" -ForegroundColor Green
+        Write-Host "Skipping caching of third-party scoped package (rule: skip scoped): $($PackageName)" -ForegroundColor DarkGray
         return $true
     }
 
@@ -578,7 +624,8 @@ function Process-Package {
         if ($LASTEXITCODE -ne 0) {
             Write-Warning "The original package '$($PackageName)@$($ConcreteVersion)' no longer exists on the public NPM registry. You are installing from your private cache." -ForegroundColor Red
         }
-        return $true
+        $result = $true
+        return $result
     }
 
     # Step 3: If the check failed, the package is not in the cache. Trigger the workflow.
@@ -600,19 +647,41 @@ function Process-Package {
         
         if ($workflowSucceeded) {
             Write-Host "Package should now be cached. The script will attempt to use it." -ForegroundColor Green
-            # Returning $true allows the main script to proceed with installation immediately.
-            return $true
+            $result = $true
         } else {
             Write-Host "Workflow failed or timed out. Please check the Actions tab in your GitHub repository." -ForegroundColor Red
-            return $false
+            $result = $false
         }
     }
     catch {
         Write-Host "Error starting GitHub workflow for $($PackageName)" -ForegroundColor Red
         Write-Host "Check your PAT permissions and repository configuration." -ForegroundColor Red
         Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
+        $result = $false
     }
+    
+    # Optionally recurse into transitive dependencies for caching
+    if ($Recurse -and $result) {
+        try {
+            $depsJson = npm view "$PackageName@$ConcreteVersion" dependencies --json --registry=https://registry.npmjs.org/ 2>$null
+            if (-not [string]::IsNullOrEmpty($depsJson) -and $depsJson -ne 'undefined') {
+                $depObj = $null
+                try { $depObj = $depsJson | ConvertFrom-Json } catch { $depObj = $null }
+                if ($depObj -ne $null) {
+                    Write-Host " Recursing into transitive dependencies of $PackageName@$ConcreteVersion (count: $($depObj.Keys.Count))" -ForegroundColor DarkCyan
+                    foreach ($depName in $depObj.Keys) {
+                        $depSpec = $depObj[$depName]
+                        # Avoid runaway recursion for large graphs; still leverage hash guard
+                        Process-Package -PackageName $depName -VersionSpec $depSpec -Recurse -NoLicenseRecursion | Out-Null
+                    }
+                }
+            }
+        } catch {
+            Write-Host "Warning: Failed to enumerate transitive dependencies for $PackageName@$ConcreteVersion : $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    return $result
 }
 
 function Format-Json {
@@ -682,7 +751,7 @@ if ($args.Count -gt 0) {
         }
 
         # Now, process the package with the correctly parsed name and version
-        $canInstall = Process-Package -PackageName $packageNameFromArg -VersionSpec $versionSpecFromArg
+    $canInstall = Process-Package -PackageName $packageNameFromArg -VersionSpec $versionSpecFromArg -Recurse
         if ($canInstall) {
             # Resolve concrete version
             $installVersion = Get-PackageVersion -PackageName $packageNameFromArg -VersionSpec $versionSpecFromArg
@@ -764,18 +833,18 @@ else {
     
     $cachedCount = 0
     $pendingCount = 0
-    
+    $finalResolvedDeps = @{}
     foreach ($entry in $allDependencies.GetEnumerator()) {
-        $isAvailable = Process-Package -PackageName $entry.Name -VersionSpec $entry.Value
+        $isAvailable = Process-Package -PackageName $entry.Name -VersionSpec $entry.Value -Recurse
+        $resolvedVersion = Get-PackageVersion -PackageName $entry.Name -VersionSpec $entry.Value
         if ($isAvailable) {
-            $resolvedVersion = Get-PackageVersion -PackageName $entry.Name -VersionSpec $entry.Value
             $scopedInstall = "@$GithubUsername/$($entry.Name)@$resolvedVersion"
             try {
                 # Scoped install; .npmrc handles registry routing
                 $cacheOut = npm install $scopedInstall --no-save 2>&1 | Tee-Object -Variable rawCacheOut
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "Cached / verified $scopedInstall" -ForegroundColor Green
-                    Update-PackageJsonDependency -PackageName $entry.Name -Version $resolvedVersion
+                    $finalResolvedDeps[$entry.Name] = $resolvedVersion
                     Ensure-UnscopedAlias -PackageName $entry.Name
                     $cachedCount++
                 } else {
@@ -784,7 +853,7 @@ else {
                         npm install "$($entry.Name)@$resolvedVersion" --save-exact --no-save
                         if ($LASTEXITCODE -eq 0) {
                             Write-Host "Installed unscoped $($entry.Name)@$resolvedVersion from public registry" -ForegroundColor Yellow
-                            Update-PackageJsonDependency -PackageName $entry.Name -Version $resolvedVersion
+                            $finalResolvedDeps[$entry.Name] = $resolvedVersion
                             $cachedCount++
                         } else {
                             Write-Host "Error installing fallback unscoped $($entry.Name)@$resolvedVersion" -ForegroundColor Red
@@ -803,6 +872,26 @@ else {
             $pendingCount++
         }
     }
+
+    # Update package.json only once at the end with all resolved versions
+    if ($finalResolvedDeps.Count -gt 0) {
+        $pkgPath = Join-Path (Get-Location) 'package.json'
+        if (Test-Path $pkgPath) {
+            try {
+                $jsonRaw = Get-Content $pkgPath -Raw
+                $pkgObj = $jsonRaw | ConvertFrom-Json
+                if (-not $pkgObj.dependencies) { $pkgObj | Add-Member -NotePropertyName dependencies -NotePropertyValue (@{}) }
+                foreach ($depName in $finalResolvedDeps.Keys) {
+                    $pkgObj.dependencies.PSObject.Properties.Remove($depName) | Out-Null 2>$null
+                    $pkgObj.dependencies | Add-Member -NotePropertyName $depName -NotePropertyValue $finalResolvedDeps[$depName] -Force
+                }
+                ConvertTo-Json $pkgObj -Depth 10 | Format-Json | Set-Content $pkgPath -Encoding UTF8
+                Write-Host "package.json updated with all resolved dependency versions." -ForegroundColor DarkGreen
+            } catch {
+                Write-Warning "Failed to update package.json at end: $($_.Exception.Message)"
+            }
+        }
+    }
     
     Write-Host "`nSummary:" -ForegroundColor Magenta
     Write-Host "Already cached: $cachedCount packages" -ForegroundColor Green
@@ -814,6 +903,17 @@ else {
         Write-Host "Run this script again once workflows complete to verify all packages are cached." -ForegroundColor Yellow
     } else {
         Write-Host "`nAll dependencies are cached and ready to use!" -ForegroundColor Green
+        try {
+            $installOutput = npm install 2>&1 | Tee-Object -Variable rawInstallOut
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "All dependencies installed successfully from cache." -ForegroundColor Green
+            } else {
+                Write-Host "Error during 'npm install':" -ForegroundColor Red
+                Write-Host $rawInstallOut -ForegroundColor Red
+            }
+        } catch {
+            Write-Host "Exception during 'npm install': $_" -ForegroundColor Red
+        }
     }
 }
 
