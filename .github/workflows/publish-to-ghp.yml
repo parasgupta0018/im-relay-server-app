@@ -196,186 +196,145 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish Package to GitHub Packages
-        if: steps.check_github_package.outputs.exists == 'false'
+      - name: Publish Full Dependency Graph (Rescoped)
         run: |
-          cd cached-packages/package
-          echo "Publishing main package from extracted package directory"
-          npm publish --ignore-scripts
-          echo "Main package published to GitHub Packages successfully"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "Publishing full dependency graph with rescoped names..."
 
-      - name: Publish All Dependencies to GitHub Packages
-        run: |
-          echo "Publishing all dependencies to GitHub Packages..."
-          
-          # Check if dependency-cache exists and has files
-          if [ ! -d "dependency-cache" ]; then
-            echo "No dependency-cache directory found, skipping dependency publishing"
-            exit 0
+          MAIN_ORIG_NAME=${{ steps.sanitize_name.outputs.sanitized_name }}
+          MAIN_VERSION=${{ steps.resolve_version.outputs.resolved_version }}
+
+          # Collect all tarballs (dependencies + main)
+          if [ ! -d dependency-cache ]; then
+            echo "No dependency-cache directory found. Aborting publish graph step."; exit 1; fi
+          if ls dependency-cache/*.tgz 1>/dev/null 2>&1; then
+            echo "Dependency tgz files present."; else echo "No dependency tgz files found."; fi
+
+          # Ensure main package tarball exists (from cached-packages step)
+          if ls cached-packages/${MAIN_ORIG_NAME}-${MAIN_VERSION}.tgz 1>/dev/null 2>&1; then
+            cp cached-packages/${MAIN_ORIG_NAME}-${MAIN_VERSION}.tgz dependency-cache/ 2>/dev/null || true
           fi
-          
-          dep_count=$(ls -1 dependency-cache/*.tgz 2>/dev/null | wc -l)
-          if [ "$dep_count" -eq 0 ]; then
-            echo "No dependency packages found in cache, skipping dependency publishing"
-            exit 0
-          fi
-          
-          echo "Found $dep_count dependency packages to process"
+
           cd dependency-cache
-          
-          # List all .tgz files for debugging
-          echo "Available .tgz files:"
-          ls -la *.tgz 2>/dev/null || echo "No .tgz files found"
-          
-          # Create a script to process each dependency
-          cat > publish_deps.js << 'EOF'
+
+          # Create publisher script with two-pass strategy: map + rewrite + publish
+          cat > publish_graph.js << 'EOF'
           const fs = require('fs');
-          const { execSync } = require('child_process');
           const path = require('path');
-          
-          // Get list of all .tgz files
+          const { execSync } = require('child_process');
+
+          const owner = process.env.GH_OWNER;
+          if (!owner) { console.error('GH_OWNER env missing'); process.exit(1); }
+          const token = process.env.NODE_AUTH_TOKEN || '';
+
+          const registry = 'https://npm.pkg.github.com';
           const tgzFiles = fs.readdirSync('.').filter(f => f.endsWith('.tgz'));
-          console.log(`Found ${tgzFiles.length} dependency packages to process`);
-          
-          if (tgzFiles.length === 0) {
-            console.log('No .tgz files found in dependency-cache directory');
-            process.exit(0);
-          }
-          
-          let published = 0;
-          let skipped = 0;
-          let errors = 0;
-          
-          for (const tgzFile of tgzFiles) {
+          if (!tgzFiles.length) { console.log('No tgz files found'); process.exit(0); }
+          console.log('Found tarballs:', tgzFiles.length);
+
+          const extractRoot = '.extract';
+          if (!fs.existsSync(extractRoot)) fs.mkdirSync(extractRoot);
+
+          // First pass: extract metadata & build name mapping
+          const map = {}; // originalName -> scopedName
+          const pkgMeta = {}; // originalName -> { version, dir }
+
+          for (const file of tgzFiles) {
+            const base = file.replace(/\.tgz$/, '');
+            const outDir = path.join(extractRoot, base);
+            if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
             try {
-              console.log(`\nProcessing: ${tgzFile}`);
-              
-              // Check if file exists
-              if (!fs.existsSync(tgzFile)) {
-                console.log(`File ${tgzFile} does not exist, skipping...`);
-                errors++;
-                continue;
+              execSync(`tar -xzf ${file} -C ${outDir}`);
+              const pkgPath = path.join(outDir, 'package', 'package.json');
+              if (!fs.existsSync(pkgPath)) { console.warn('Missing package.json in', file); continue; }
+              const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+              const orig = pkg.name;
+              const scoped = `@${owner}/` + orig.split('/').pop();
+              map[orig] = scoped;
+              pkgMeta[orig] = { version: pkg.version, dir: path.dirname(pkgPath) };
+            } catch (e) {
+              console.error('Failed to extract/read', file, e.message);
+            }
+          }
+
+          fs.writeFileSync('scoped-map.json', JSON.stringify(map, null, 2));
+          console.log('Built mapping for', Object.keys(map).length, 'packages');
+
+          // Helper to rewrite dependency object using map
+          function rewriteDeps(obj) {
+            if (!obj) return obj;
+            const out = {};
+            for (const [name, range] of Object.entries(obj)) {
+              if (map[name]) out[map[name]] = range; else out[name] = range;
+            }
+            return out;
+          }
+
+          // Second pass: rewrite & publish
+          let published = 0, skipped = 0, errors = 0;
+          for (const [orig, meta] of Object.entries(pkgMeta)) {
+            const pkgJsonPath = path.join(meta.dir, 'package.json');
+            const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+            const newName = map[orig];
+
+            // Skip if already scoped correctly
+            if (pkg.name === newName) {
+              console.log('Already scoped, continuing:', newName);
+            } else {
+              pkg.name = newName;
+            }
+            pkg.publishConfig = { registry };
+
+            // Rewrite dependency graphs
+            pkg.dependencies = rewriteDeps(pkg.dependencies);
+            pkg.devDependencies = rewriteDeps(pkg.devDependencies);
+            pkg.peerDependencies = rewriteDeps(pkg.peerDependencies);
+            pkg.optionalDependencies = rewriteDeps(pkg.optionalDependencies);
+
+            // Clean scripts that may run (safety).
+            if (pkg.scripts) {
+              for (const k of Object.keys(pkg.scripts)) {
+                if (/pre|post|install|test|build/i.test(k)) delete pkg.scripts[k];
               }
-              
-              // Extract the package
-              const extractDir = tgzFile.replace('.tgz', '-extract');
-              execSync(`mkdir -p ${extractDir}`);
-              execSync(`tar -xzf ${tgzFile} -C ${extractDir}`);
-              
-              // Read the package.json
-              const packageDir = path.join(extractDir, 'package');
-              const packageJsonPath = path.join(packageDir, 'package.json');
-              
-              if (!fs.existsSync(packageJsonPath)) {
-                console.log(`No package.json found in ${packageDir}, skipping...`);
-                skipped++;
-                continue;
-              }
-              
-              const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-              const originalName = pkg.name;
-              
-              // Skip if this is the main package (already handled separately)
-              if (pkg.name === '${{ steps.sanitize_name.outputs.sanitized_name }}') {
-                console.log(`Skipping main package ${pkg.name} (handled separately)`);
-                skipped++;
-                continue;
-              }
-              
-              // Skip if already scoped to our organization
-              if (pkg.name.startsWith('@${{ github.repository_owner }}/')) {
-                console.log(`Package ${pkg.name} already scoped to our org, skipping...`);
-                skipped++;
-                continue;
-              }
-              
-              // Create scoped name
-              const scopedName = '@${{ github.repository_owner }}/' + pkg.name.split('/').pop();
-              
-              // Check if package already exists in GitHub Packages
-              try {
-                const checkCmd = `npm view ${scopedName}@${pkg.version} version --registry=https://npm.pkg.github.com`;
-                execSync(checkCmd, { 
-                  stdio: 'pipe', 
-                  env: { ...process.env, NODE_AUTH_TOKEN: process.env.NODE_AUTH_TOKEN } 
-                });
-                console.log(`Package ${scopedName}@${pkg.version} already exists, skipping...`);
-                skipped++;
-                continue;
-              } catch (e) {
-                // Package doesn't exist, continue with publishing
-                console.log(`Package ${scopedName}@${pkg.version} not found, will publish...`);
-              }
-              
-              // Update package.json
-              pkg.name = scopedName;
-              pkg.publishConfig = { registry: 'https://npm.pkg.github.com' };
-              
-              if (!pkg.repository) {
-                pkg.repository = {
-                  type: 'git',
-                  url: 'git+https://github.com/${{ github.repository }}.git'
-                };
-              }
-              
-              // Remove problematic scripts
-              if (pkg.scripts) {
-                const scriptsToRemove = ['test', 'prepublishOnly', 'prepack', 'postpack', 'prepare'];
-                scriptsToRemove.forEach(script => {
-                  if (pkg.scripts[script]) {
-                    delete pkg.scripts[script];
-                  }
-                });
-                Object.keys(pkg.scripts).forEach(scriptName => {
-                  if (scriptName.includes('test') || scriptName.includes('build')) {
-                    delete pkg.scripts[scriptName];
-                  }
-                });
-              }
-              
-              // Write updated package.json
-              fs.writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2));
-              
-              // Publish the package
-              const originalCwd = process.cwd();
-              process.chdir(packageDir);
-              try {
-                execSync('npm publish --ignore-scripts --registry=https://npm.pkg.github.com', { 
-                  stdio: 'inherit',
-                  env: { ...process.env, NODE_AUTH_TOKEN: process.env.NODE_AUTH_TOKEN }
-                });
-                console.log(`Successfully published: ${scopedName}@${pkg.version}`);
-                published++;
-              } catch (publishError) {
-                console.error(`Failed to publish ${scopedName}@${pkg.version}:`, publishError.message);
-                errors++;
-              }
-              
-              process.chdir(originalCwd);
-              
-            } catch (error) {
-              console.error(`Error processing ${tgzFile}:`, error.message);
+            }
+
+            if (!pkg.repository) {
+              pkg.repository = { type: 'git', url: `git+https://github.com/${process.env.GITHUB_REPOSITORY}.git` };
+            }
+
+            fs.writeFileSync(pkgJsonPath, JSON.stringify(pkg, null, 2));
+
+            // Check existence before publish
+            const id = `${pkg.name}@${pkg.version}`;
+            try {
+              execSync(`npm view ${pkg.name}@${pkg.version} version --registry=${registry}`, { stdio: 'pipe', env: { ...process.env, NODE_AUTH_TOKEN: token } });
+              console.log('Exists, skipping:', id);
+              skipped++;
+              continue;
+            } catch { /* not found */ }
+
+            try {
+              execSync('npm publish --ignore-scripts --registry=' + registry, { cwd: meta.dir, stdio: 'inherit', env: { ...process.env, NODE_AUTH_TOKEN: token } });
+              console.log('Published:', id);
+              published++;
+            } catch (e) {
+              console.error('Publish failed for', id, e.message);
               errors++;
             }
           }
-          
-          console.log(`\nPublishing complete:`);
-          console.log(`- Published: ${published} packages`);
-          console.log(`- Skipped: ${skipped} packages`);
-          console.log(`- Errors: ${errors} packages`);
-          
-          if (published === 0 && errors > 0) {
-            console.log('WARNING: No packages were published and there were errors.');
-            console.log('This might indicate an issue with the dependency caching process.');
-          }
+
+          console.log('\nSummary');
+            console.log('Published:', published);
+          console.log('Skipped:', skipped);
+          console.log('Errors:', errors);
+          if (!published && errors) process.exitCode = 1;
           EOF
-          
-          # Run the publishing script
-          node publish_deps.js
+
+          GH_OWNER=${{ github.repository_owner }} GH_REPO=${{ github.repository }} \
+            GH_MAIN=${{ steps.sanitize_name.outputs.sanitized_name }} \
+            node publish_graph.js
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_OWNER: ${{ github.repository_owner }}
 
       - name: Log Package Skipped
         if: steps.check_github_package.outputs.exists == 'true'
